@@ -20,6 +20,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+from performer_pytorch import FastAttention
 
 from utils import trunc_normal_
 
@@ -99,12 +100,25 @@ class Block(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        
+        # print('self.attn = FastAttention')
+        # self.attn = FastAttention(nb_features = dim, dim_heads = num_heads, causal = False)
+        # self.qkv_ = nn.Linear(dim, dim * 3, bias=qkv_bias)      
+        # self.num_heads = num_heads
+
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
+
     def forward(self, x, return_attention=False):
+        # x = self.norm1(x)
+        # B, N, C = x.shape
+        # qkv = self.qkv_(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        # q, k, v = qkv[0], qkv[1], qkv[2]
+        # y, attn = self.attn(q, k,v)
+
         y, attn = self.attn(self.norm1(x))
         if return_attention:
             return attn
@@ -217,7 +231,7 @@ class VisionTransformer(nn.Module):
         x = self.prepare_tokens(x)
         for i, blk in enumerate(self.blocks):
             if i < len(self.blocks) - 1:
-                x = blk(x)
+               x = blk(x)
             else:
                 # return attention of the last block
                 return blk(x, return_attention=True)
