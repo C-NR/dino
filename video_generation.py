@@ -31,7 +31,7 @@ import vision_transformer as vits
 
 
 FOURCC = {
-    "mp4": cv2.VideoWriter_fourcc(*"MP4V"),
+    "mp4": cv2.VideoWriter_fourcc(*"mp4v"),
     "avi": cv2.VideoWriter_fourcc(*"XVID"),
 }
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -51,9 +51,15 @@ class VideoGenerator:
             sys.exit(1)
         else:
             if self.args.video_only:
-                self._generate_video_from_images(
-                    self.args.input_path, self.args.output_path
+                attention_folder = os.path.join(
+                    self.args.output_path, "attention"
                 )
+                self._generate_video_from_images(
+                    attention_folder, self.args.output_path
+                )
+                # self._generate_video_from_images(
+                #     self.args.input_path, self.args.output_path
+                # )
             else:
                 # If input path exists
                 if os.path.exists(self.args.input_path):
@@ -67,9 +73,10 @@ class VideoGenerator:
                         os.makedirs(frames_folder, exist_ok=True)
                         os.makedirs(attention_folder, exist_ok=True)
 
-                        self._extract_frames_from_video(
-                            self.args.input_path, frames_folder
-                        )
+                        if not self.args.no_extract:
+                            self._extract_frames_from_video(
+                                self.args.input_path, frames_folder
+                            )
 
                         self._inference(
                             frames_folder,
@@ -117,40 +124,81 @@ class VideoGenerator:
             count += 1
 
     def _generate_video_from_images(self, inp: str, out: str):
-        img_array = []
-        attention_images_list = sorted(glob.glob(os.path.join(inp, "attn-*.jpg")))
 
-        # Get size of the first image
-        with open(attention_images_list[0], "rb") as f:
-            img = Image.open(f)
-            img = img.convert("RGB")
-            size = (img.width, img.height)
-            img_array.append(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR))
+        subfolder_list = sorted(glob.glob(os.path.join(out, "attention*")))
+        # print(subfolder_list)
+        for inp in subfolder_list:
+            parts = inp.split('/')
+            sub = parts[-1]
+ 
+            files = glob.glob(os.path.join(inp, "attn-*.jpg"))
+            files.extend(glob.glob(os.path.join(inp, "attn-*.png")))
 
-        print(f"Generating video {size} to {out}")
+            # attention_images_list = sorted(glob.glob(os.path.join(inp, "attn-*.jpg")))
+            attention_images_list = sorted(files)
+            # print(inp)
+            # print(len(attention_images_list))
+            # continue
+            if len(attention_images_list) <= 0:
+                continue
+            size = None
+            # thresh = 0
+            # if self.args.threshold > 1 and self.args.blend:
+            #     thresh = self.args.threshold
 
-        for filename in tqdm(attention_images_list[1:]):
-            with open(filename, "rb") as f:
-                img = Image.open(f)
-                img = img.convert("RGB")
-                img_array.append(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR))
+            for filename in tqdm(attention_images_list):
+                # img = cv2.imread(filename,0)
+                img = cv2.imread(filename)
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                if size == None:
+                    height, width, _ = img.shape
+                    size = (width, height)
+                    print(f"Generating video {size} to {out}")
+                    break
 
-        out = cv2.VideoWriter(
-            os.path.join(out, "video." + self.args.video_format),
-            FOURCC[self.args.video_format],
-            self.args.fps,
-            size,
-        )
+            if size == None:
+                print('Could not determine the image size for ' + inp)
+            else: 
+                vout = cv2.VideoWriter(
+                    os.path.join(out, sub + "_video." + self.args.video_format),
+                    FOURCC[self.args.video_format],
+                    self.args.fps,
+                    size,
+                )
 
-        for i in range(len(img_array)):
-            out.write(img_array[i])
-        out.release()
-        print("Done")
+                for filename in tqdm(attention_images_list):
+                    # img = cv2.imread(filename,0)
+                    img = cv2.imread(filename)
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+                    if self.args.blend:
+                        # print(filename.replace(sub + "/attn-","frames/"))
+                        org = cv2.imread(filename.replace(sub + "/attn-","frames/"))
+                        org = cv2.resize(org, size)
+                        org = cv2.cvtColor(org, cv2.COLOR_RGB2BGR)
+                        # img = cv2.blur(img, (20, 20))
+                        # _, img = cv2.threshold(img,thresh,255,cv2.THRESH_TOZERO)
+                        # _, mask = cv2.threshold(img,thresh,255,cv2.THRESH_BINARY)
+                        # img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                        # mask = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                        alpha = 0.5
+                        beta = (1.0 - alpha)
+                        img = cv2.addWeighted(img, alpha, org, beta, 0.0)
+                        # img = cv2.bitwise_and(img, mask)
+                    vout.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+
+                vout.release()
+                print("Done")
 
     def _inference(self, inp: str, out: str):
         print(f"Generating attention images to {out}")
 
-        for img_path in tqdm(sorted(glob.glob(os.path.join(inp, "*.jpg")))):
+        files = glob.glob(os.path.join(inp, "*.jpg"))
+        files.extend(glob.glob(os.path.join(inp, "*.png")))
+
+        # for img_path in tqdm(sorted(glob.glob(os.path.join(inp, "*.jpg")))):
+        # for img_path in tqdm(sorted(glob.glob(os.path.join(inp, "*.png")))):
+        for img_path in tqdm(sorted(files)):
             with open(img_path, "rb") as f:
                 img = Image.open(f)
                 img = img.convert("RGB")
@@ -225,6 +273,10 @@ class VideoGenerator:
                 .numpy()
             )
 
+            # print(attentions)
+
+            #exit(0)
+
             # save attentions heatmaps
             fname = os.path.join(out, "attn-" + os.path.basename(img_path))
             plt.imsave(
@@ -233,9 +285,24 @@ class VideoGenerator:
                     attentions[i] * 1 / attentions.shape[0]
                     for i in range(attentions.shape[0])
                 ),
-                cmap="inferno",
+                cmap="hot",
+                # cmap="gray",
                 format="jpg",
             )
+
+            for i in range(attentions.shape[0]):
+                if not os.path.isdir(out + str(i)):
+                    os.mkdir(out + str(i))
+                fname = os.path.join(out + str(i), "attn-" + os.path.basename(img_path))
+                plt.imsave(
+                    fname=fname,
+                    arr = attentions[i] * 1,
+                    cmap="hot",
+                    # cmap="gray",
+                    format="jpg",
+                )
+
+
 
     def __load_model(self):
         # build model
@@ -257,6 +324,7 @@ class VideoGenerator:
                     f"Take key {self.args.checkpoint_key} in provided checkpoint dict"
                 )
                 state_dict = state_dict[self.args.checkpoint_key]
+            print(state_dict.items())
             state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
             # remove `backbone.` prefix induced by multicrop wrapper
             state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}
@@ -293,6 +361,17 @@ class VideoGenerator:
                 )
         return model
 
+def extract_feature(model, frame, return_h_w=False):
+    """Extract one frame feature everytime."""
+    out = model.get_intermediate_layers(frame.unsqueeze(0).cuda(), n=1)[0]
+    out = out[:, 1:, :]  # we discard the [CLS] token
+    h, w = int(frame.shape[1] / model.patch_embed.patch_size), int(frame.shape[2] / model.patch_embed.patch_size)
+    dim = out.shape[-1]
+    out = out[0].reshape(h, w, dim)
+    out = out.reshape(-1, dim)
+    if return_h_w:
+        return out, h, w
+    return out
 
 def parse_args():
     parser = argparse.ArgumentParser("Generation self-attention video")
@@ -353,6 +432,16 @@ def parse_args():
         action="store_true",
         help="""Use this flag if you only want to generate a video and not all attention images.
             If used, --input_path must be set to the folder of attention images. Ex: ./attention/""",
+    )
+    parser.add_argument(
+        "--blend",
+        action="store_true",
+        help="""Use this flag if you want to generate mask tho original video with the results.""",
+    )
+    parser.add_argument(
+        "--no_extract",
+        action="store_true",
+        help="""Use this flag if you only want to generate a video and not extract all images.""",
     )
     parser.add_argument(
         "--fps",
