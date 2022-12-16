@@ -34,6 +34,10 @@ import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
 
+from typing import  Tuple, List, Dict, Optional, Union, Callable, cast
+from pathlib import Path
+import os
+
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(torchvision_models.__dict__[name]))
@@ -128,6 +132,105 @@ def get_args_parser():
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     return parser
 
+class ReturnIndexDataset(datasets.ImageFolder):
+    def __getitem__(self, idx):
+        img, lab = super(ReturnIndexDataset, self).__getitem__(idx)
+        return img, idx
+
+
+    def find_classes(self, directory: str) -> Tuple[List[str], Dict[str, int]]:
+        """Finds the class folders in a dataset.
+
+        # See :class:`DatasetFolder` for details.
+        # """
+        # classes = sorted(entry.name for entry in os.scandir(directory) if entry.is_dir())
+        # if not classes:
+        #     raise FileNotFoundError(f"Couldn't find any class folder in {directory}.")
+
+        # class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
+        classes = ["unknown"]
+        class_to_idx = {"unknown": 0}
+        return classes, class_to_idx
+
+    def has_file_allowed_extension(self, filename: str, extensions: Union[str, Tuple[str, ...]]) -> bool:
+        """Checks if a file is an allowed extension.
+
+        Args:
+            filename (string): path to a file
+            extensions (tuple of strings): extensions to consider (lowercase)
+
+        Returns:
+            bool: True if the filename ends with one of given extensions
+        """
+        return filename.lower().endswith(extensions if isinstance(extensions, str) else tuple(extensions))
+
+    def make_dataset(
+        self,
+        directory: str,
+        class_to_idx: Optional[Dict[str, int]] = None,
+        extensions: Optional[Union[str, Tuple[str, ...]]] = None,
+        is_valid_file: Optional[Callable[[str], bool]] = None,
+    ) -> List[Tuple[str, int]]:
+        """Generates a list of samples of a form (path_to_sample, class).
+
+        See :class:`DatasetFolder` for details.
+
+        Note: The class_to_idx parameter is here optional and will use the logic of the ``find_classes`` function
+        by default.
+        """
+        directory = os.path.expanduser(directory)
+
+        # if class_to_idx is None:
+        #     _, class_to_idx = self.find_classes(directory)
+        # elif not class_to_idx:
+        #     raise ValueError("'class_to_index' must have at least one entry to collect any samples.")
+
+        both_none = extensions is None and is_valid_file is None
+        both_something = extensions is not None and is_valid_file is not None
+        if both_none or both_something:
+            raise ValueError("Both extensions and is_valid_file cannot be None or not None at the same time")
+
+        if extensions is not None:
+
+            def is_valid_file(x: str) -> bool:
+                return self.has_file_allowed_extension(x, extensions)  # type: ignore[arg-type]
+
+        is_valid_file = cast(Callable[[str], bool], is_valid_file)
+
+        instances = []
+        # available_classes = set()
+        # for target_class in sorted(class_to_idx.keys()):
+        #     class_index = class_to_idx[target_class]
+        #     target_dir = os.path.join(directory, target_class)
+        #     if not os.path.isdir(target_dir):
+        #         continue
+        #     for root, _, fnames in sorted(os.walk(target_dir, followlinks=True)):
+        #         for fname in sorted(fnames):
+        #             path = os.path.join(root, fname)
+        #             if is_valid_file(path):
+        #                 item = path, class_index
+        #                 instances.append(item)
+
+        #                 if target_class not in available_classes:
+        #                     available_classes.add(target_class)
+
+        if os.path.isdir(directory):
+            for root, _, fnames in sorted(os.walk(directory, followlinks=True)):
+                for fname in sorted(fnames):
+                    path = os.path.join(root, fname)
+                    if is_valid_file(path):
+                        item = path, 0
+                        instances.append(item)
+
+
+        # empty_classes = set(class_to_idx.keys()) - available_classes
+        # if empty_classes:
+        #     msg = f"Found no valid file for the classes {', '.join(sorted(empty_classes))}. "
+        #     if extensions is not None:
+        #         msg += f"Supported extensions are: {extensions if isinstance(extensions, str) else ', '.join(extensions)}"
+        #     raise FileNotFoundError(msg)
+
+        return instances
 
 def train_dino(args):
     utils.init_distributed_mode(args)
@@ -142,7 +245,9 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    # dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    dataset = ReturnIndexDataset(args.data_path, transform=transform)
+    
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -214,7 +319,8 @@ def train_dino(args):
     # ============ preparing loss ... ============
     dino_loss = DINOLoss(
         args.out_dim,
-        args.local_crops_number + 2,  # total number of crops = 2 global crops + local_crops_number
+        # args.local_crops_number + 2,  # total number of crops = 2 global crops + local_crops_number
+        args.local_crops_number + 1,  # total number of crops = 1 global crops + local_crops_number
         args.warmup_teacher_temp,
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
@@ -315,7 +421,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         images = [im.cuda(non_blocking=True) for im in images]
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
+            # teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
+            teacher_output = teacher(images[:1])  # only the 1 global views pass through the teacher
             student_output = student(images)
             loss = dino_loss(student_output, teacher_output, epoch)
 
@@ -387,7 +494,8 @@ class DINOLoss(nn.Module):
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[epoch]
         teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
-        teacher_out = teacher_out.detach().chunk(2)
+        # teacher_out = teacher_out.detach().chunk(2)
+        teacher_out = teacher_out.detach().chunk(1)
 
         total_loss = 0
         n_loss_terms = 0
@@ -432,15 +540,17 @@ class DataAugmentationDINO(object):
         ])
 
         # first global crop
+        self.crop1 = transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC)
         self.global_transfo1 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            self.crop1,
             flip_and_color_jitter,
             utils.GaussianBlur(1.0),
             normalize,
         ])
         # second global crop
+        self.crop2 = transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC)
         self.global_transfo2 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            self.crop2,
             flip_and_color_jitter,
             utils.GaussianBlur(0.1),
             utils.Solarization(0.2),
@@ -457,10 +567,18 @@ class DataAugmentationDINO(object):
 
     def __call__(self, image):
         crops = []
-        crops.append(self.global_transfo1(image))
-        crops.append(self.global_transfo2(image))
+        gcrop1 = self.global_transfo1(image)
+        crops.append(gcrop1)
+        # gcrop2 = self.global_transfo2(image)
+        # crops.append(gcrop2)
+        # print(self.crop1)
+        cropped1 = self.crop1.forward(image)
+        # cropped2 = self.crop1.forward(image)
+        # print(cropped1)
+        # exit(0)
         for _ in range(self.local_crops_number):
-            crops.append(self.local_transfo(image))
+            crops.append(self.local_transfo(cropped1))
+            # crops.append(self.local_transfo(image))
         return crops
 
 
