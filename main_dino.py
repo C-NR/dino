@@ -109,11 +109,13 @@ def get_args_parser():
     parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
 
     # Multi-crop parameters
-    parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.4, 1.),
+    # parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.4, 1.),
+    parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.05, 0.4),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for large global view cropping. When disabling multi-crop (--local_crops_number 0), we
         recommand using a wider range of scale ("--global_crops_scale 0.14 1." for example)""")
-    parser.add_argument('--local_crops_number', type=int, default=8, help="""Number of small
+    # parser.add_argument('--local_crops_number', type=int, default=8, help="""Number of small
+    parser.add_argument('--local_crops_number', type=int, default=24, help="""Number of small
         local views to generate. Set this parameter to 0 to disable multi-crop training.
         When disabling multi-crop we recommend to use "--global_crops_scale 0.14 1." """)
     parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4),
@@ -124,7 +126,8 @@ def get_args_parser():
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
         help='Please specify path to the ImageNet training data.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
-    parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
+    # parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
+    parser.add_argument('--saveckp_freq', default=1, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
@@ -240,24 +243,47 @@ def train_dino(args):
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
-    transform = DataAugmentationDINO(
-        args.global_crops_scale,
-        args.local_crops_scale,
-        args.local_crops_number,
-    )
-    # dataset = datasets.ImageFolder(args.data_path, transform=transform)
-    dataset = ReturnIndexDataset(args.data_path, transform=transform)
-    
-    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
-        sampler=sampler,
-        batch_size=args.batch_size_per_gpu,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-    print(f"Data loaded: there are {len(dataset)} images.")
+    num_data_sets = 10
+    dataloaders = []
+    for i in range(0, num_data_sets):
+        transform = DataAugmentationDINO(
+            args.global_crops_scale,
+            args.local_crops_scale,
+            args.local_crops_number,
+        )
+        dataset = ReturnIndexDataset(args.data_path, transform=transform)  
+        sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            sampler=sampler,
+            batch_size=args.batch_size_per_gpu,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+        dataloaders.append(data_loader)
+        if i + 1 == num_data_sets:
+            print(f"Data loaded: there are {len(dataset)} images in {num_data_sets} data set variations.")
+
+
+    # transform = DataAugmentationDINO(
+    #     args.global_crops_scale,
+    #     args.local_crops_scale,
+    #     args.local_crops_number,
+    # )
+
+    # # dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    # dataset = ReturnIndexDataset(args.data_path, transform=transform)  
+    # sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+    # data_loader = torch.utils.data.DataLoader(
+    #     dataset,
+    #     sampler=sampler,
+    #     batch_size=args.batch_size_per_gpu,
+    #     num_workers=args.num_workers,
+    #     pin_memory=True,
+    #     drop_last=True,
+    # )
+    # print(f"Data loaded: there are {len(dataset)} images.")
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
@@ -372,33 +398,65 @@ def train_dino(args):
 
     start_time = time.time()
     print("Starting DINO training !")
+
     for epoch in range(start_epoch, args.epochs):
-        data_loader.sampler.set_epoch(epoch)
+        for i in range (0, num_data_sets):
+            data_loader = dataloaders[i]
+            print("--- Dataset " + str(i) + " ---")
+            data_loader.sampler.set_epoch(epoch)
 
-        # ============ training one epoch of DINO ... ============
-        train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
-            data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
-            epoch, fp16_scaler, args)
+            # ============ training one epoch of DINO ... ============
+            train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
+                data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
+                epoch, fp16_scaler, args)
 
-        # ============ writing logs ... ============
-        save_dict = {
-            'student': student.state_dict(),
-            'teacher': teacher.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'epoch': epoch + 1,
-            'args': args,
-            'dino_loss': dino_loss.state_dict(),
-        }
-        if fp16_scaler is not None:
-            save_dict['fp16_scaler'] = fp16_scaler.state_dict()
-        utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
-        if args.saveckp_freq and epoch % args.saveckp_freq == 0:
-            utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     'epoch': epoch}
-        if utils.is_main_process():
-            with (Path(args.output_dir) / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
+            # ============ writing logs ... ============
+            save_dict = {
+                'student': student.state_dict(),
+                'teacher': teacher.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch + 1,
+                'args': args,
+                'dino_loss': dino_loss.state_dict(),
+            }
+            if fp16_scaler is not None:
+                save_dict['fp16_scaler'] = fp16_scaler.state_dict()
+            utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
+            if args.saveckp_freq and epoch % args.saveckp_freq == 0:
+                utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                         'epoch': epoch}
+            if utils.is_main_process():
+                with (Path(args.output_dir) / "log.txt").open("a") as f:
+                    f.write(json.dumps(log_stats) + "\n")
+        print("================================================================")
+        # data_loader.sampler.set_epoch(epoch)
+
+        # # ============ training one epoch of DINO ... ============
+        # train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
+        #     data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
+        #     epoch, fp16_scaler, args)
+
+        # # ============ writing logs ... ============
+        # save_dict = {
+        #     'student': student.state_dict(),
+        #     'teacher': teacher.state_dict(),
+        #     'optimizer': optimizer.state_dict(),
+        #     'epoch': epoch + 1,
+        #     'args': args,
+        #     'dino_loss': dino_loss.state_dict(),
+        # }
+        # if fp16_scaler is not None:
+        #     save_dict['fp16_scaler'] = fp16_scaler.state_dict()
+        # utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
+        # if args.saveckp_freq and epoch % args.saveckp_freq == 0:
+        #     utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
+        # log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+        #              'epoch': epoch}
+        # if utils.is_main_process():
+        #     with (Path(args.output_dir) / "log.txt").open("a") as f:
+        #         f.write(json.dumps(log_stats) + "\n")
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
@@ -416,6 +474,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
             param_group["lr"] = lr_schedule[it]
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
+        
+        # #empty cache
+        # torch.cuda.empty_cache()
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
